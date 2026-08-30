@@ -1,0 +1,14 @@
+node_modules/
+dist/
+target/
+.env
+.DS_Store
+*.log
+*.part
+src-tauri/binaries/yt-dlp-*
+
+
+# 内部开发文档（不随公开仓库分发）
+审核报告.md
+需求文档-*.md
+调研-*.md
