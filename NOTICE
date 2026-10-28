@@ -1,0 +1,11 @@
+GetTube with Hongguo support
+Copyright (c) 2026 MagicYang (rhythmy-ops) and respective upstream contributors.
+
+This combined version is distributed under GNU GPL version 3 only (LICENSE).
+Original GetTube code retains its MIT copyright and grant (LICENSE-MIT).
+Hongguo code originates from jackotom/hongguo-drama and its documented upstreams;
+see engines/hongguo/NOTICE, UPSTREAM-NOTICE and vendor/licenses/NOTICE.txt.
+Changes made 2026-10-28: independent local engine, common task dispatcher,
+per-request proxy policy, episode selection, verified downloads and cancellation.
+Provide corresponding application and adapter source, dependency lockfiles,
+notices and build instructions when distributing the combined version.

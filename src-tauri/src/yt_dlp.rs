@@ -1,30 +1,11 @@
-use crate::database::Database;
 use crate::models::{
-    AppSettings, DownloadTask, ListEntry, ListInfo, MediaFormat, MediaInfo, Platform, ProxyMode,
+    AppSettings, ListEntry, ListInfo, MediaFormat, MediaInfo, Platform, ProxyMode,
 };
 use regex::Regex;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
-use tauri::Emitter;
+use std::process::Command;
 use tauri::Manager;
 use uuid::Uuid;
-
-#[derive(Default)]
-struct ProcessState {
-    running: HashMap<String, Arc<Mutex<Child>>>,
-    reserved: HashSet<String>,
-    cancelled: HashSet<String>,
-}
-
-#[derive(Clone, Default)]
-pub struct ProcessRegistry(Arc<Mutex<ProcessState>>);
-
-/// 入队/任务结束等"可能腾出槽位"的事件通知，唤醒调度线程
-#[derive(Clone)]
-pub struct Notify(pub std::sync::mpsc::Sender<()>);
 
 /// 引擎路径解析结果缓存（仅缓存命中；未命中时每次重扫，装好后无需重启）
 static ENGINE_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
@@ -72,445 +53,25 @@ pub fn archive_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String
         .map_err(|error| format!("无法确定配置目录：{error}"))
 }
 
-pub struct DownloadRequest {
-    pub source_url: String,
-    pub title: String,
-    pub format_id: String,
-    pub platform: Platform,
-    pub batch_id: Option<String>,
-    /// 批次展示名，同时作为已消毒的输出子文件夹名
-    pub batch_name: Option<String>,
-}
-
-/// 启动调度线程：任何事件（或 1 秒超时兜底）都会尝试把排队任务拉起到并发上限
-pub fn start_dispatcher(
-    app: tauri::AppHandle,
-    database: Database,
-    registry: ProcessRegistry,
-) -> Notify {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let notify = Notify(tx);
-    let dispatcher_notify = notify.clone();
-    std::thread::spawn(move || loop {
-        let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
-        dispatch_once(&app, &database, &registry, &dispatcher_notify);
-    });
-    notify
-}
-
-pub fn dispatch_once(
-    app: &tauri::AppHandle,
-    database: &Database,
-    registry: &ProcessRegistry,
-    notify: &Notify,
-) {
-    let settings = match crate::settings::load(app) {
-        Ok(settings) => settings,
-        Err(_) => return,
-    };
-    let capacity = usize::from(settings.concurrent_downloads).max(1);
-    loop {
-        let queued = match database.list_queued(32) {
-            Ok(value) => value,
-            Err(_) => return,
-        };
-        let next = {
-            let Ok(mut state) = registry.0.lock() else {
-                return;
-            };
-            if state.running.len() + state.reserved.len() >= capacity {
-                return;
-            }
-            let Some(candidate) = queued
-                .iter()
-                .find(|(task, _)| !state.reserved.contains(&task.id))
-                .cloned()
-            else {
-                return;
-            };
-            state.reserved.insert(candidate.0.id.clone());
-            candidate
-        };
-        let (task, format_id) = next;
-        let snapshot = task.clone();
-        if let Err(error) = launch(app, database, registry, notify, task, format_id, &settings) {
-            // launch 失败说明任务自身有问题（Cookie 缺失、链接失效等），
-            // 释放槽位并把原因落库，继续尝试队列中的下一个
-            if let Ok(mut state) = registry.0.lock() {
-                state.reserved.remove(&snapshot.id);
-            }
-            let mut failed = snapshot;
-            failed.status = "failed".into();
-            failed.error = Some(error);
-            let _ = database.update_progress(
-                &failed.id,
-                "failed",
-                0.0,
-                None,
-                None,
-                failed.error.as_deref(),
-            );
-            let _ = app.emit("task-progress", &failed);
-        }
-    }
-}
-
-/// 任务入队：只写库和事件，不直接启动；由调度器按并发上限拉起
-pub fn enqueue(
-    app: &tauri::AppHandle,
-    database: &Database,
-    notify: &Notify,
-    request: DownloadRequest,
-) -> Result<DownloadTask, String> {
-    let task = DownloadTask {
-        id: Uuid::new_v4().to_string(),
-        url: request.source_url,
-        title: request.title,
-        platform: request.platform,
-        status: "queued".into(),
-        progress: 0.0,
-        speed: None,
-        eta: None,
-        output_path: None,
-        error: None,
-        batch_id: request.batch_id,
-        batch_name: request.batch_name,
-    };
-    database.insert(&task, &request.format_id)?;
-    let _ = app.emit("task-progress", &task);
-    let _ = notify.0.send(());
-    Ok(task)
-}
-
-/// 批量任务已经由调用方完整预校验；这里用一个事务入库，避免半批成功。
-pub fn enqueue_many(
-    app: &tauri::AppHandle,
-    database: &Database,
-    notify: &Notify,
-    requests: Vec<DownloadRequest>,
-) -> Result<Vec<DownloadTask>, String> {
-    let tasks_with_formats: Vec<(DownloadTask, String)> = requests
-        .into_iter()
-        .map(|request| {
-            (
-                DownloadTask {
-                    id: Uuid::new_v4().to_string(),
-                    url: request.source_url,
-                    title: request.title,
-                    platform: request.platform,
-                    status: "queued".into(),
-                    progress: 0.0,
-                    speed: None,
-                    eta: None,
-                    output_path: None,
-                    error: None,
-                    batch_id: request.batch_id,
-                    batch_name: request.batch_name,
-                },
-                request.format_id,
-            )
-        })
-        .collect();
-    database.insert_many(&tasks_with_formats)?;
-    let tasks: Vec<DownloadTask> = tasks_with_formats
-        .into_iter()
-        .map(|(task, _)| task)
-        .collect();
-    for task in &tasks {
-        let _ = app.emit("task-progress", task);
-    }
-    let _ = notify.0.send(());
-    Ok(tasks)
-}
-
-fn launch(
-    app: &tauri::AppHandle,
-    database: &Database,
-    registry: &ProcessRegistry,
-    notify: &Notify,
-    task: DownloadTask,
-    format_id: String,
-    settings: &AppSettings,
-) -> Result<(), String> {
-    let mut task = task;
-    // 入队后到拉起前可能已被取消
-    if let Ok((current, _)) = database.task_full(&task.id) {
-        if current.status != "queued" {
-            if let Ok(mut state) = registry.0.lock() {
-                state.reserved.remove(&task.id);
-            }
-            return Ok(());
-        }
-    }
-    let platform = crate::platform::detect(&task.url)?;
-    // 链接解析（抖音短链归一化、t.co 复验）放在拉起时执行，重试天然重新解析
-    let download_url = crate::resolver::execution_url(app, &task.url, platform, settings)?;
-    let (format_expr, extra_args) = split_format_spec(&format_id);
-    let mut command = base_command(app, platform, settings)?;
-    let output_dir = download_output_dir(app, settings, task.batch_name.as_deref())?;
-    std::fs::create_dir_all(&output_dir).map_err(|error| format!("无法创建下载目录：{error}"))?;
-    let output_template = output_dir
-        .join(&settings.filename_template)
-        .to_string_lossy()
-        .to_string();
-    command.args([
-        "--newline",
-        "--progress",
-        "--no-playlist",
-        "--print",
-        "after_move:filepath",
-        "--format",
-        &format_expr,
-        "--output",
-        &output_template,
-    ]);
-    if extra_args.is_empty() {
-        command.args(["--merge-output-format", "mp4"]);
-    } else {
-        command.args(&extra_args);
-    }
-    command.args(subtitle_args(platform, settings));
-    command.args(embed_args(&format_id, settings));
-    // 下载归档仅作用于批量场景：单视频手动下载是明确意图，永不跳过（需求 v4 F2/D2）
-    if settings.download_archive && task.batch_id.is_some() {
-        if let Ok(archive) = archive_path(app) {
-            command.args(["--download-archive", &archive.to_string_lossy()]);
-        }
-    }
-    command.args(["--", &download_url]);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // 独立进程组，取消时可连同 ffmpeg 等子进程一并终止
-        command.process_group(0);
-    }
-    let mut child = command.spawn().map_err(start_error)?;
-    // spawn 后再核对一次取消状态，关闭"取消→仍被拉起"的窗口
-    if let Ok((current, _)) = database.task_full(&task.id) {
-        if current.status != "queued" {
-            let _ = child.kill();
-            if let Ok(mut state) = registry.0.lock() {
-                state.reserved.remove(&task.id);
-            }
-            return Ok(());
-        }
-    }
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "无法读取下载进度".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "无法读取下载错误信息".to_string())?;
-    task.status = "downloading".into();
-    task.progress = 0.0;
-    task.speed = None;
-    task.eta = None;
-    let _ = database.update_progress(&task.id, "downloading", 0.0, None, None, None);
-    let _ = app.emit("task-progress", &task);
-    let child = Arc::new(Mutex::new(child));
-    let registered = registry.0.lock().map(|mut state| {
-        state.reserved.remove(&task.id);
-        state.running.insert(task.id.clone(), child.clone());
-        true
-    });
-    if registered.is_err() {
-        let _ = child.lock().map(|mut process| process.kill());
-        return Err("任务注册表不可用".into());
-    }
-    monitor(
-        app.clone(),
-        database.clone(),
-        registry.clone(),
-        notify.clone(),
-        task,
-        child,
-        stdout,
-        stderr,
-    );
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn monitor(
-    app: tauri::AppHandle,
-    database: Database,
-    registry: ProcessRegistry,
-    notify: Notify,
-    mut task: DownloadTask,
-    child: Arc<Mutex<Child>>,
-    stdout: impl std::io::Read + Send + 'static,
-    stderr: impl std::io::Read + Send + 'static,
-) {
-    std::thread::spawn(move || {
-        let progress = Regex::new(r"\[download\]\s+([0-9.]+)%.*?at\s+([^\s]+).*?ETA\s+([^\s]+)")
-            .expect("valid progress regex");
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let stdout_sender = sender.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let _ = stdout_sender.send((false, line));
-            }
-        });
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let _ = sender.send((true, line));
-            }
-        });
-        let mut stderr_lines = Vec::new();
-        for (is_stderr, line) in receiver {
-            if is_stderr {
-                if stderr_lines.len() == 100 {
-                    stderr_lines.remove(0);
-                }
-                stderr_lines.push(line.clone());
-            }
-            if let Some((value, speed, eta)) = parse_progress(&progress, &line) {
-                task.progress = value;
-                task.speed = Some(speed);
-                task.eta = Some(eta);
-                let _ = database.update_progress(
-                    &task.id,
-                    "downloading",
-                    task.progress,
-                    task.speed.as_deref(),
-                    task.eta.as_deref(),
-                    None,
-                );
-                let _ = app.emit("task-progress", &task);
-            } else if line.contains("[Merger]") || line.contains("[ExtractAudio]") {
-                task.status = "processing".into();
-                let _ = database.update_progress(
-                    &task.id,
-                    "processing",
-                    task.progress,
-                    task.speed.as_deref(),
-                    task.eta.as_deref(),
-                    None,
-                );
-                let _ = app.emit("task-progress", &task);
-            } else if !is_stderr {
-                // --print after_move:filepath 输出的最终文件路径
-                if let Some(path) = final_output_path(&line) {
-                    let _ = database.set_output_path(&task.id, &path);
-                    task.output_path = Some(path);
-                }
-            }
-        }
-        let exit = child
-            .lock()
-            .ok()
-            .and_then(|mut process| process.wait().ok());
-        let was_cancelled = registry.0.lock().ok().is_some_and(|mut state| {
-            state.running.remove(&task.id);
-            state.cancelled.remove(&task.id)
-        });
-        if was_cancelled {
-            task.status = "cancelled".into();
-            task.speed = None;
-            task.eta = None;
-            task.error = None;
-            let _ =
-                database.update_progress(&task.id, "cancelled", task.progress, None, None, None);
-            let _ = app.emit("task-progress", &task);
-        } else if exit.is_some_and(|status| status.success()) {
-            task.status = "completed".into();
-            task.progress = 100.0;
-            task.speed = None;
-            task.eta = None;
-            let _ = database.update_progress(&task.id, "completed", 100.0, None, None, None);
-            let _ = app.emit("task-progress", &task);
-        } else {
-            task.status = "failed".into();
-            task.error = Some(map_download_error(&stderr_lines.join("\n"), task.platform));
-            let _ = database.update_progress(
-                &task.id,
-                "failed",
-                task.progress,
-                None,
-                None,
-                task.error.as_deref(),
-            );
-            let _ = app.emit("task-progress", &task);
-        }
-        // 终态落定，唤醒调度器填补空出的槽位
-        let _ = notify.0.send(());
-    });
-}
-
-pub fn cancel(
-    app: &tauri::AppHandle,
-    database: &Database,
-    registry: &ProcessRegistry,
-    id: &str,
-) -> Result<(), String> {
-    let running = {
-        let mut state = registry
-            .0
-            .lock()
-            .map_err(|_| "任务注册表不可用".to_string())?;
-        if let Some(process) = state.running.get(id).cloned() {
-            state.cancelled.insert(id.to_string());
-            Some(process)
-        } else {
-            None
-        }
-    };
-    if let Some(process) = running {
-        let mut child = process.lock().map_err(|_| "无法访问下载进程".to_string())?;
-        #[cfg(unix)]
-        unsafe {
-            // 先向整个进程组发 SIGKILL，连带终止 yt-dlp 派生的 ffmpeg 等子进程
-            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-        }
-        child
-            .kill()
-            .map_err(|error| format!("无法取消任务：{error}"))?;
-        // 最终状态由 monitor 线程在进程退出后统一写入
-        return Ok(());
-    }
-    // 不在运行：排队中的任务直接取消（launch 的双重核对保证不会被再拉起）
-    if let Ok((mut task, _)) = database.task_full(id) {
-        if task.status == "queued" {
-            database.mark_cancelled(id)?;
-            task.status = "cancelled".into();
-            task.speed = None;
-            task.eta = None;
-            let _ = app.emit("task-progress", &task);
-            return Ok(());
-        }
-    }
-    Err("任务没有在运行".into())
-}
-
-pub fn cancel_batch(
-    app: &tauri::AppHandle,
-    database: &Database,
-    registry: &ProcessRegistry,
-    batch_id: &str,
-) -> Result<(), String> {
-    let tasks = database.list_by_batch(batch_id)?;
-    for task in tasks.iter().filter(|task| {
-        matches!(
-            task.status.as_str(),
-            "queued" | "downloading" | "processing"
-        )
-    }) {
-        let _ = cancel(app, database, registry, &task.id);
-    }
-    Ok(())
-}
-
-fn base_command(
+pub(crate) fn base_command(
     app: &tauri::AppHandle,
     platform: Platform,
     settings: &AppSettings,
 ) -> Result<Command, String> {
     let mut command = Command::new(engine_path()?);
-    if let Some(proxy) = proxy_for(platform, settings)? {
-        command.args(["--proxy", &proxy]);
+    let proxy = proxy_for(platform, settings)?.unwrap_or_default();
+    command.args(["--proxy", &proxy]);
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ] {
+        command.env_remove(key);
     }
     if let Some(cookies) = crate::cookies::effective_path(app, settings, platform)? {
         command.arg("--cookies").arg(cookies);
@@ -693,6 +254,7 @@ pub fn parse_list_json(value: &Value, limit: usize) -> Result<ListInfo, String> 
         });
     }
     Ok(ListInfo {
+        platform: None,
         title: string_value(value, "title"),
         uploader: string_value(value, "uploader").or_else(|| string_value(value, "channel")),
         entries,
@@ -701,7 +263,7 @@ pub fn parse_list_json(value: &Value, limit: usize) -> Result<ListInfo, String> 
 }
 
 /// `audio-mp3/m4a/opus` 拆解为格式表达式 + 音频提取参数；其余原样作为 --format 值
-fn split_format_spec(spec: &str) -> (String, Vec<String>) {
+pub(crate) fn split_format_spec(spec: &str) -> (String, Vec<String>) {
     if let Some(audio_format) = spec.strip_prefix("audio-") {
         (
             "bestaudio/best".into(),
@@ -717,7 +279,7 @@ fn split_format_spec(spec: &str) -> (String, Vec<String>) {
 }
 
 /// 字幕与弹幕参数（D5/D10）：B 站弹幕默认开、字幕默认关，仅 YouTube/B站生效
-fn subtitle_args(platform: Platform, settings: &AppSettings) -> Vec<String> {
+pub(crate) fn subtitle_args(platform: Platform, settings: &AppSettings) -> Vec<String> {
     let mut langs: Vec<&str> = Vec::new();
     if matches!(platform, Platform::Bilibili) && settings.danmaku_download {
         langs.push("danmaku");
@@ -738,7 +300,7 @@ fn subtitle_args(platform: Platform, settings: &AppSettings) -> Vec<String> {
 
 /// 元数据与封面嵌入（需求 v4 F1）：MP3 补封面格式转换；M4A/MP4 缺 AtomicParsley
 /// 时 yt-dlp 自动降级为警告，任务不失败（D5）
-fn embed_args(format_id: &str, settings: &AppSettings) -> Vec<String> {
+pub(crate) fn embed_args(format_id: &str, settings: &AppSettings) -> Vec<String> {
     if !settings.embed_media_meta {
         return Vec::new();
     }
@@ -751,7 +313,7 @@ fn embed_args(format_id: &str, settings: &AppSettings) -> Vec<String> {
     args
 }
 
-fn download_output_dir(
+pub(crate) fn download_output_dir(
     app: &tauri::AppHandle,
     settings: &AppSettings,
     subfolder: Option<&str>,
@@ -849,7 +411,7 @@ fn format_choices(value: &Value, platform: Platform) -> Vec<MediaFormat> {
     choices
 }
 
-fn parse_progress(pattern: &Regex, line: &str) -> Option<(f64, String, String)> {
+pub(crate) fn parse_progress(pattern: &Regex, line: &str) -> Option<(f64, String, String)> {
     let values = pattern.captures(line)?;
     Some((
         values[1].parse().ok()?,
@@ -858,7 +420,7 @@ fn parse_progress(pattern: &Regex, line: &str) -> Option<(f64, String, String)> 
     ))
 }
 
-fn final_output_path(line: &str) -> Option<String> {
+pub(crate) fn final_output_path(line: &str) -> Option<String> {
     let path = line.trim();
     let windows_drive = path.as_bytes().get(1) == Some(&b':')
         && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic);
@@ -873,7 +435,7 @@ fn string_value(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
-fn start_error(error: std::io::Error) -> String {
+pub(crate) fn start_error(error: std::io::Error) -> String {
     if error.kind() == std::io::ErrorKind::NotFound {
         "未找到 yt-dlp，请先安装或配置下载引擎".into()
     } else {
@@ -898,7 +460,7 @@ fn map_error(stderr: &str, platform: Platform) -> String {
     }
 }
 
-fn map_download_error(stderr: &str, platform: Platform) -> String {
+pub(crate) fn map_download_error(stderr: &str, platform: Platform) -> String {
     let lower = stderr.to_lowercase();
     if lower.contains("requested format") {
         return "没有可用的无水印格式，该内容可能仅提供带水印源".into();

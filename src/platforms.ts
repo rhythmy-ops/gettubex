@@ -1,6 +1,13 @@
 import type { Platform } from "./types";
 
+export const HONGGUO_FORMATS = [
+  { id: "auto", label: "自动画质（验证实际分辨率）" },
+  { id: "1080p", label: "至少 1080p（不足则失败）" },
+  { id: "720p", label: "至少 720p（不足则失败）" },
+];
+
 const PLATFORM_HOSTS: Array<[Platform, RegExp]> = [
+  ["hongguo", /(^|\.)((hongguoduanju\.com)|(novelquickapp\.com)|(changdunovel\.com))$/i],
   ["youtube", /(^|\.)((youtube\.com)|(youtu\.be))$/i],
   ["bilibili", /(^|\.)((bilibili\.com)|(b23\.tv))$/i],
   ["douyin", /(^|\.)((douyin\.com)|(iesdouyin\.com))$/i],
@@ -47,6 +54,7 @@ export function looksLikeChannel(input: string): boolean {
 
 /** 播放列表 / 合集 / 多 P / 收藏夹：进入"列表预览"模式 */
 export function looksLikeList(input: string): boolean {
+  if (detectPlatform(input) === "hongguo") return true;
   const url = parsed(input);
   if (!url) return false;
   const path = url.pathname.replace(/\/+$/, "");
@@ -74,5 +82,6 @@ export const platformLabel: Record<Platform, string> = {
   bilibili: "哔哩哔哩",
   douyin: "抖音",
   twitter: "X",
+  hongguo: "红果短剧",
   unknown: "未识别",
 };

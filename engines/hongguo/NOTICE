@@ -1,0 +1,19 @@
+GetTube Hongguo adapter — modified 2026-10-28
+License: GPL-3.0-only. The combined GetTube version with this adapter is distributed under GPL-3.0-only.
+The original GetTube MIT notices are preserved in ../../LICENSE-MIT.
+
+Source: https://github.com/jackotom/hongguo-drama
+Pinned revision: a61f9575cd9b67e1278db9151010a97225f7646e (4.2.0)
+Files in vendor/ are copied from src/native/ of that revision, except catalog.js
+which contains only the original readRouterData function, with Electron removed.
+hongguo.js removes unrelated source dispatch and disables trusted-DNS hedges
+to ensure every network request observes GetTube's explicit per-task proxy.
+See UPSTREAM-NOTICE and vendor/licenses/NOTICE.txt for inherited authors,
+upstream repositories and algorithm attribution.
+
+GetTube additions: core.cjs, server.cjs, Rust stdio bridge and task integration.
+No upstream Electron application, player, updater, FFmpeg or Chromium binary
+is redistributed here. Local execution requires Node >=22.12 and user-installed
+FFmpeg/ffprobe. Original upstream licensing and notices remain applicable.
+Dependency versions and download integrity hashes are in package-lock.json;
+their license texts are included in installed node_modules packages.

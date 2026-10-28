@@ -17,8 +17,13 @@ pub fn detect(input: &str) -> Result<Platform, String> {
         Ok(Platform::Douyin)
     } else if domain_matches(host, &["x.com", "twitter.com", "t.co"]) {
         Ok(Platform::Twitter)
+    } else if domain_matches(
+        host,
+        &["hongguoduanju.com", "novelquickapp.com", "changdunovel.com"],
+    ) {
+        Ok(Platform::Hongguo)
     } else {
-        Err("当前仅支持 YouTube、哔哩哔哩、抖音和 X".into())
+        Err("当前仅支持 YouTube、哔哩哔哩、抖音、X 和红果".into())
     }
 }
 

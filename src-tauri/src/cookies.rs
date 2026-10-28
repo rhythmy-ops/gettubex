@@ -24,6 +24,7 @@ impl CookieDrafts {
             Platform::Bilibili => &self.bilibili,
             Platform::Douyin => &self.douyin,
             Platform::Twitter => &self.twitter,
+            Platform::Hongguo | Platform::Unknown => "",
         }
     }
 }
@@ -224,6 +225,8 @@ fn platform_key(platform: Platform) -> &'static str {
         Platform::Bilibili => "bilibili",
         Platform::Douyin => "douyin",
         Platform::Twitter => "twitter",
+        Platform::Hongguo => "hongguo",
+        Platform::Unknown => "unknown",
     }
 }
 fn platform_name(platform: Platform) -> &'static str {
@@ -232,6 +235,8 @@ fn platform_name(platform: Platform) -> &'static str {
         Platform::Bilibili => "哔哩哔哩",
         Platform::Douyin => "抖音",
         Platform::Twitter => "X",
+        Platform::Hongguo => "红果",
+        Platform::Unknown => "未知平台",
     }
 }
 fn unix_now() -> i64 {

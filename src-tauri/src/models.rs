@@ -7,6 +7,8 @@ pub enum Platform {
     Bilibili,
     Douyin,
     Twitter,
+    Hongguo,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +48,8 @@ pub struct DownloadTask {
     pub error: Option<String>,
     pub batch_id: Option<String>,
     pub batch_name: Option<String>,
+    #[serde(default)]
+    pub media_details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +66,8 @@ pub struct ListEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListInfo {
+    #[serde(default)]
+    pub platform: Option<Platform>,
     pub title: Option<String>,
     pub uploader: Option<String>,
     pub entries: Vec<ListEntry>,
@@ -125,6 +131,8 @@ pub struct CookieSettings {
     pub douyin: PlatformCookieSettings,
     #[serde(default)]
     pub twitter: PlatformCookieSettings,
+    #[serde(skip)]
+    pub unsupported: PlatformCookieSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -211,6 +219,7 @@ impl CookieSettings {
             Platform::Bilibili => &self.bilibili,
             Platform::Douyin => &self.douyin,
             Platform::Twitter => &self.twitter,
+            Platform::Hongguo | Platform::Unknown => &self.unsupported,
         }
     }
 
@@ -220,6 +229,7 @@ impl CookieSettings {
             Platform::Bilibili => &mut self.bilibili,
             Platform::Douyin => &mut self.douyin,
             Platform::Twitter => &mut self.twitter,
+            Platform::Hongguo | Platform::Unknown => &mut self.unsupported,
         }
     }
 }

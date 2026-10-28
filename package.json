@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test": "vitest run",
-    "tauri": "tauri"
+    "test": "vitest run src && npm run test:hongguo",
+    "tauri": "tauri",
+    "setup:hongguo": "npm ci --prefix engines/hongguo --ignore-scripts",
+    "test:hongguo": "npm test --prefix engines/hongguo"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
@@ -23,5 +25,6 @@
     "typescript": "^7.0.2",
     "vite": "^8.2.2",
     "vitest": "^4.1.11"
-  }
+  },
+  "license": "GPL-3.0-only"
 }

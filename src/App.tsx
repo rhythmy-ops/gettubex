@@ -14,8 +14,8 @@ import {
   ExternalLink,
   ListChecks,
 } from "lucide-react";
-import { appVersion, cancelBatch, cancelDownload, checkUpdates, checkYtdlp, clearArchive, clearManagedCookie, clearTasks, createDownload, createDownloads, defaultSettings, listTasks, loadSettings, onTaskProgress, openReleaseUrl, probeList, probeMedia, retryDownload, saveSettings } from "./backend";
-import { detectPlatform, extractFirstUrl, looksLikeChannel, looksLikeList, platformLabel } from "./platforms";
+import { checkHongguo, appVersion, cancelBatch, cancelDownload, checkUpdates, checkYtdlp, clearArchive, clearManagedCookie, clearTasks, createDownload, createDownloads, defaultSettings, listTasks, loadSettings, onTaskProgress, openReleaseUrl, probeList, probeMedia, retryDownload, saveSettings } from "./backend";
+import { HONGGUO_FORMATS, detectPlatform, extractFirstUrl, looksLikeChannel, looksLikeList, platformLabel } from "./platforms";
 import type { AppSettings, CookieDrafts, CookiePlatform, DownloadTask, EngineStatus, ListInfo, MediaInfo, UpdateResult } from "./types";
 
 type Page = "download" | "tasks" | "history" | "settings";
@@ -51,6 +51,7 @@ function formatDuration(seconds?: number): string {
 function downloadKeyOf(url: string): string | null {
   try {
     const parsed = new URL(url);
+    if (detectPlatform(url) === "hongguo") return "hongguo:" + parsed.pathname;
     const v = parsed.searchParams.get("v");
     if (v) return v;
     const bv = parsed.pathname.match(/BV[a-z0-9]+/i);
@@ -139,7 +140,7 @@ export default function App() {
       throw new Error("列表为空或无法读取条目");
     }
     setListInfo(info);
-    setListFormat(LIST_FORMATS[0].id);
+    setListFormat(info.platform === "hongguo" ? "auto" : LIST_FORMATS[0].id);
     // D1：小列表默认全选，大列表默认不选
     setSelected(new Set(info.entries.length <= 20 ? info.entries.map((_, index) => index) : []));
     setRangeText("");
@@ -148,11 +149,12 @@ export default function App() {
   async function inspect() {
     const url = extractFirstUrl(input);
     if (!url || platform === "unknown") {
-      setMessage("请输入受支持的 YouTube、哔哩哔哩、抖音或 X 链接");
+      setMessage("请输入受支持的 YouTube、哔哩哔哩、抖音、X 或红果分享链接");
       return;
     }
     setBusy(true);
     setMessage("");
+    resetListState();
     const isChannel = looksLikeChannel(url);
     const isList = isChannel || looksLikeList(url);
     try {
@@ -163,7 +165,7 @@ export default function App() {
           const info = await probeList(url);
           if (info.entries.length === 0) throw new Error("列表为空或无法读取条目");
           setListInfo(info);
-          setListFormat(LIST_FORMATS[0].id);
+          setListFormat(info.platform === "hongguo" ? "auto" : LIST_FORMATS[0].id);
           setSelected(new Set(info.entries.length <= 20 ? info.entries.map((_, index) => index) : []));
           setRangeText("");
         }
@@ -174,7 +176,7 @@ export default function App() {
         setFormat(result.formats[0]?.id ?? "best");
       }
     } catch (error) {
-      if (isList) {
+      if (isList && platform !== "hongguo") {
         // 列表探测失败时回落单视频解析（如带 list 参数的单视频）
         try {
           const result = await probeMedia(url);
@@ -336,7 +338,7 @@ export default function App() {
           <section className="page hero-page">
             <div className="eyebrow">LOCAL MEDIA DOWNLOADER</div>
             <h1>把喜欢的内容，<br /><span>留在自己的设备里。</span></h1>
-            <p className="lead">支持 YouTube、哔哩哔哩、抖音和 X，播放列表与 UP 主作品可勾选批量下载。</p>
+            <p className="lead">支持 YouTube、哔哩哔哩、抖音、X 和红果短剧，播放列表与 UP 主作品可勾选批量下载。</p>
             <div className="url-card">
               <div className="url-row">
                 <Link2 size={21} />
@@ -363,7 +365,7 @@ export default function App() {
             {listInfo && <div className="list-card">
               <div className="list-head">
                 <div>
-                  <div className="eyebrow">{isChannelUrl ? "CHANNEL" : "PLAYLIST"}</div>
+                  <div className="eyebrow">{listInfo.platform === "hongguo" ? "红果短剧 · 测试版" : isChannelUrl ? "CHANNEL" : "PLAYLIST"}</div>
                   <h2>{listInfo.title || listInfo.uploader || "列表"}</h2>
                   <span>共 {listInfo.total} 条{listInfo.entries.length < listInfo.total && ` · 已加载 ${listInfo.entries.length} 条`}</span>
                 </div>
@@ -375,6 +377,7 @@ export default function App() {
                   </label>
                 )}
               </div>
+              {listInfo.platform === "hongguo" && <p className="hint">下载时逐集验证片源；完成前检查完整音视频。仅支持视频，字幕、弹幕和音频导出设置不适用于红果。</p>}
               <div className="list-toolbar">
                 <button className="ghost" onClick={selectDisplayed}>全选</button>
                 <button className="ghost" onClick={invertDisplayed}>反选</button>
@@ -389,7 +392,7 @@ export default function App() {
                     <span className="idx">{index + 1}</span>
                     <span className="row-title">{entry.title || entry.id}</span>
                     <span className="row-duration">{formatDuration(entry.duration)}</span>
-                    {entry.viewCount !== undefined && <span className="row-views">{entry.viewCount.toLocaleString()} 次播放</span>}
+                    {entry.viewCount != null && <span className="row-views">{entry.viewCount.toLocaleString()} 次播放</span>}
                     {entry.source && <span className="row-source">{entry.source}</span>}
                     {isDownloaded(entry.url, tasks) && <span className="badge-done">已下载</span>}
                   </label>
@@ -399,7 +402,7 @@ export default function App() {
                 <div className="format-pick">
                   <SlidersHorizontal size={15} />
                   <select value={listFormat} onChange={(e) => setListFormat(e.target.value)}>
-                    {LIST_FORMATS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+                    {(listInfo.platform === "hongguo" ? HONGGUO_FORMATS : LIST_FORMATS).map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
                   </select>
                 </div>
                 <button className="primary" onClick={downloadList} disabled={busy || selected.size === 0}>
@@ -424,7 +427,7 @@ export default function App() {
 
 function TaskRow({ task, onCancel, onRetry }: { task: DownloadTask; onCancel: (id: string) => void; onRetry: (id: string) => void }) {
   return <article>
-    <div className="task-icon"><Download /></div><div className="task-main"><strong>{task.title}</strong><span>{platformLabel[task.platform]} · {displayStatus(task)}{task.speed ? ` · ${task.speed}` : ""}{task.eta ? ` · 剩余 ${task.eta}` : ""}</span>{task.error && <span className="task-error">{task.error}</span>}<div className="progress"><i style={{ width: `${task.progress}%` }} /></div></div><b>{Math.round(task.progress)}%</b>
+    <div className="task-icon"><Download /></div><div className="task-main"><strong>{task.title}</strong><span>{platformLabel[task.platform]} · {displayStatus(task)}{task.mediaDetails?.actualQuality ? ` · ${task.mediaDetails.actualQuality}` : ""}{task.speed ? ` · ${task.speed}` : ""}{task.eta ? ` · 剩余 ${task.eta}` : ""}</span>{task.error && <span className="task-error">{task.error}</span>}<div className="progress"><i style={{ width: `${task.progress}%` }} /></div></div><b>{Math.round(task.progress)}%</b>
     {ACTIVE_STATUSES.includes(task.status) && <button className="ghost" onClick={() => onCancel(task.id)}>取消</button>}
     {["failed", "cancelled"].includes(task.status) && <button className="ghost" onClick={() => onRetry(task.id)}>重试</button>}
   </article>;
@@ -520,7 +523,7 @@ function HistoryPage({ tasks, onClear }: { tasks: DownloadTask[]; onClear: () =>
         </span>
       : <button className="ghost" onClick={() => setConfirming(true)}>清除历史</button>)}
   </div></div>
-    {tasks.length === 0 ? <EmptyPage icon={<FolderClock />} title="还没有下载历史" text="完成的任务会安全地记录在本机。" /> : <div className="task-list">{tasks.map((task) => <article key={task.id}><div className="task-icon"><CheckCircle2 /></div><div className="task-main"><strong>{task.title}</strong><span>{platformLabel[task.platform]} · {displayStatus(task)}{task.outputPath ? ` · ${task.outputPath}` : ""}{task.batchName ? ` · ${task.batchName}` : ""}</span></div></article>)}</div>}
+    {tasks.length === 0 ? <EmptyPage icon={<FolderClock />} title="还没有下载历史" text="完成的任务会安全地记录在本机。" /> : <div className="task-list">{tasks.map((task) => <article key={task.id}><div className="task-icon"><CheckCircle2 /></div><div className="task-main"><strong>{task.title}</strong><span>{platformLabel[task.platform]} · {displayStatus(task)}{task.mediaDetails?.actualQuality ? ` · ${task.mediaDetails.actualQuality}` : ""}{task.outputPath ? ` · ${task.outputPath}` : ""}{task.batchName ? ` · ${task.batchName}` : ""}</span></div></article>)}</div>}
   </section>;
 }
 
@@ -531,6 +534,16 @@ function EmptyPage({ icon, title, text }: { icon: React.ReactNode; title: string
 function SettingsPage({ value, onChange, version, engine, onRefreshEngine }: { value: AppSettings; onChange: (v: AppSettings) => void; version: string; engine: EngineStatus | null; onRefreshEngine: () => void }) {
   const [feedback, setFeedback] = useState<{ ok: boolean; text: string } | null>(null);
   const [confirmClearArchive, setConfirmClearArchive] = useState(false);
+  const [hongguoStatus, setHongguoStatus] = useState("尚未检测");
+  const [checkingHongguo, setCheckingHongguo] = useState(false);
+  async function refreshHongguo() {
+    setCheckingHongguo(true);
+    try {
+      const status = await checkHongguo();
+      setHongguoStatus(status.ready ? `可用 · Node ${status.nodeVersion} · FFmpeg / ffprobe 就绪` : `依赖不完整：${!status.ffmpeg ? "缺少 FFmpeg " : ""}${!status.ffprobe ? "缺少 ffprobe" : ""}`);
+    } catch (error) { setHongguoStatus(String(error)); }
+    finally { setCheckingHongguo(false); }
+  }
   const emptyDrafts = (): CookieDrafts => ({ youtube: "", bilibili: "", douyin: "", twitter: "" });
   const [drafts, setDrafts] = useState<CookieDrafts>(emptyDrafts);
   const [confirmClearCookie, setConfirmClearCookie] = useState<CookiePlatform | null>(null);
@@ -588,6 +601,12 @@ function SettingsPage({ value, onChange, version, engine, onRefreshEngine }: { v
       <label>代理模式<select value={value.proxy.mode} onChange={(e) => updateProxy({ mode: e.target.value as AppSettings["proxy"]["mode"] })}><option value="none">不使用代理</option><option value="system">跟随系统代理</option><option value="manual">手动配置</option></select></label>
       {value.proxy.mode === "manual" && <label>代理地址<input value={value.proxy.url} placeholder="socks5://127.0.0.1:7890" onChange={(e) => updateProxy({ url: e.target.value })} /></label>}
       <label className="checkbox"><input type="checkbox" checked={value.proxy.youtubeOnly} onChange={(e) => updateProxy({ youtubeOnly: e.target.checked })} />仅对 YouTube、X 使用代理</label>
+    </div>
+    <div className="settings-card"><h2>红果短剧 · 测试版</h2>
+      <p>匿名访问，无需登录红果账号或导入 Cookie。此功能不会给账号增加观看权限；未开放或要求额外权限的分集会明确失败。</p>
+      <div className="about-row"><span>{hongguoStatus}</span><button className="ghost" onClick={refreshHongguo} disabled={checkingHongguo}><RefreshCw size={15} />{checkingHongguo ? "检测中…" : "检查红果引擎"}</button></div>
+      <p>使用上面的保存目录和并发数量。{value.proxy.youtubeOnly || value.proxy.mode === "none" ? "当前红果直连。" : "当前红果跟随全局代理。"}粘贴分享链接后选择分集及画质即可下载。</p>
+      <p>目录权限由系统控制：请选择当前 macOS 用户有写入权限的目录。无需给红果账号单独“赋权”。</p>
     </div>
     <div className="settings-card"><h2>平台 Cookie</h2><p>可使用本地 Netscape cookies.txt，或粘贴后由 GetTube 托管。空白粘贴框不会删除已有凭证。</p>
       {(["youtube", "bilibili", "douyin", "twitter"] as CookiePlatform[]).map((platform) => <div className="cookie-group" key={platform}>

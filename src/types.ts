@@ -1,4 +1,4 @@
-export type Platform = "youtube" | "bilibili" | "douyin" | "twitter" | "unknown";
+export type Platform = "youtube" | "bilibili" | "douyin" | "twitter" | "hongguo" | "unknown";
 export type TaskStatus =
   | "probing"
   | "queued"
@@ -40,6 +40,7 @@ export interface DownloadTask {
   error?: string;
   batchId?: string;
   batchName?: string;
+  mediaDetails?: { engine?: string; seriesId?: string; episodeId?: string; episodeIndex?: number; requestedQuality?: string; actualQuality?: string; duration?: number; sha256?: string; reused?: boolean };
 }
 
 export interface ListEntry {
@@ -52,6 +53,7 @@ export interface ListEntry {
 }
 
 export interface ListInfo {
+  platform?: Platform;
   title?: string;
   uploader?: string;
   entries: ListEntry[];

@@ -1,6 +1,8 @@
 mod cookies;
 mod database;
+mod downloads;
 mod engine;
+mod hongguo;
 mod models;
 mod network;
 mod platform;
@@ -27,6 +29,9 @@ async fn probe_media(app: tauri::AppHandle, url: String) -> Result<MediaInfo, St
     tauri::async_runtime::spawn_blocking(move || {
         let settings = settings::load(&app)?;
         let download_url = resolver::execution_url(&app, &url, platform, &settings)?;
+        if matches!(platform, Platform::Hongguo) {
+            return Err("请通过分集列表选择红果剧集".into());
+        }
         yt_dlp::probe(&app, &url, &download_url, platform, &settings)
     })
     .await
@@ -40,11 +45,17 @@ async fn probe_list(
     limit: Option<u32>,
 ) -> Result<ListInfo, String> {
     let platform = platform::detect(&url)?;
-    if !matches!(platform, Platform::Youtube | Platform::Bilibili) {
-        return Err("播放列表与 UP 主功能当前仅支持 YouTube 和哔哩哔哩".into());
+    if !matches!(
+        platform,
+        Platform::Youtube | Platform::Bilibili | Platform::Hongguo
+    ) {
+        return Err("播放列表与 UP 主功能当前仅支持 YouTube、哔哩哔哩和红果".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
         let settings = settings::load(&app)?;
+        if matches!(platform, Platform::Hongguo) {
+            return hongguo::probe(&url, &settings);
+        }
         let limit = limit
             .map(|value| value.max(1) as usize)
             .unwrap_or(usize::MAX);
@@ -58,17 +69,20 @@ async fn probe_list(
 fn create_download(
     app: tauri::AppHandle,
     database: tauri::State<Database>,
-    notify: tauri::State<yt_dlp::Notify>,
+    notify: tauri::State<downloads::Notify>,
     url: String,
     format_id: String,
     title: String,
 ) -> Result<DownloadTask, String> {
     let platform = platform::detect(&url)?;
-    yt_dlp::enqueue(
+    if matches!(platform, Platform::Hongguo) {
+        hongguo::validate_episode(&url, &format_id)?;
+    }
+    downloads::enqueue(
         &app,
         database.inner(),
         notify.inner(),
-        yt_dlp::DownloadRequest {
+        downloads::DownloadRequest {
             source_url: url,
             title,
             format_id,
@@ -83,7 +97,7 @@ fn create_download(
 fn create_downloads(
     app: tauri::AppHandle,
     database: tauri::State<Database>,
-    notify: tauri::State<yt_dlp::Notify>,
+    notify: tauri::State<downloads::Notify>,
     items: Vec<BatchItem>,
     format_id: String,
     folder: String,
@@ -99,15 +113,21 @@ fn create_downloads(
     let mut requests = Vec::with_capacity(items.len());
     for item in items {
         let platform = platform::detect(&item.url)?;
-        if !matches!(platform, Platform::Youtube | Platform::Bilibili) {
-            return Err("批量下载当前仅支持 YouTube 和哔哩哔哩".into());
+        if !matches!(
+            platform,
+            Platform::Youtube | Platform::Bilibili | Platform::Hongguo
+        ) {
+            return Err("批量下载当前仅支持 YouTube、哔哩哔哩和红果".into());
+        }
+        if matches!(platform, Platform::Hongguo) {
+            hongguo::validate_episode(&item.url, &format_id)?;
         }
         let title = if item.title.trim().is_empty() {
             "未命名条目".into()
         } else {
             item.title
         };
-        requests.push(yt_dlp::DownloadRequest {
+        requests.push(downloads::DownloadRequest {
             source_url: item.url,
             title,
             format_id: format_id.clone(),
@@ -116,7 +136,7 @@ fn create_downloads(
             batch_name: Some(batch_name.clone()),
         });
     }
-    yt_dlp::enqueue_many(&app, database.inner(), notify.inner(), requests)
+    downloads::enqueue_many(&app, database.inner(), notify.inner(), requests)
 }
 
 #[tauri::command]
@@ -140,36 +160,39 @@ fn clear_tasks(database: tauri::State<Database>, scope: String) -> Result<u32, S
 fn cancel_download(
     app: tauri::AppHandle,
     database: tauri::State<Database>,
-    processes: tauri::State<yt_dlp::ProcessRegistry>,
+    processes: tauri::State<downloads::ProcessRegistry>,
     id: String,
 ) -> Result<(), String> {
-    yt_dlp::cancel(&app, database.inner(), processes.inner(), &id)
+    downloads::cancel(&app, database.inner(), processes.inner(), &id)
 }
 
 #[tauri::command]
 fn cancel_batch(
     app: tauri::AppHandle,
     database: tauri::State<Database>,
-    processes: tauri::State<yt_dlp::ProcessRegistry>,
+    processes: tauri::State<downloads::ProcessRegistry>,
     batch_id: String,
 ) -> Result<(), String> {
-    yt_dlp::cancel_batch(&app, database.inner(), processes.inner(), &batch_id)
+    downloads::cancel_batch(&app, database.inner(), processes.inner(), &batch_id)
 }
 
 #[tauri::command]
 fn retry_download(
     app: tauri::AppHandle,
     database: tauri::State<Database>,
-    notify: tauri::State<yt_dlp::Notify>,
+    notify: tauri::State<downloads::Notify>,
     id: String,
 ) -> Result<DownloadTask, String> {
     let data = database.retry_data(&id)?;
     let platform = platform::detect(&data.url)?;
-    yt_dlp::enqueue(
+    if matches!(platform, Platform::Hongguo) {
+        hongguo::validate_episode(&data.url, &data.format_id)?;
+    }
+    downloads::enqueue(
         &app,
         database.inner(),
         notify.inner(),
-        yt_dlp::DownloadRequest {
+        downloads::DownloadRequest {
             source_url: data.url,
             title: data.title,
             format_id: data.format_id,
@@ -221,6 +244,21 @@ async fn check_ytdlp(app: tauri::AppHandle, manual: bool) -> Result<engine::Engi
         .map_err(|error| format!("引擎检查线程异常退出：{error}"))?
 }
 
+#[tauri::command]
+async fn check_hongguo() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        hongguo::request(
+            &uuid::Uuid::new_v4().to_string(),
+            "status",
+            serde_json::json!({}),
+            &std::sync::atomic::AtomicBool::new(false),
+            |_| {},
+        )
+    })
+    .await
+    .map_err(|_| "红果引擎检测线程异常")?
+}
+
 /// 清空下载归档，返回清除条数
 #[tauri::command]
 fn clear_archive(app: tauri::AppHandle) -> Result<u64, String> {
@@ -255,9 +293,12 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(data_dir)?;
             let database = Database::new(app.handle()).map_err(std::io::Error::other)?;
-            let registry = yt_dlp::ProcessRegistry::default();
-            let notify =
-                yt_dlp::start_dispatcher(app.handle().clone(), database.clone(), registry.clone());
+            let registry = downloads::ProcessRegistry::default();
+            let notify = downloads::start_dispatcher(
+                app.handle().clone(),
+                database.clone(),
+                registry.clone(),
+            );
             app.manage(database);
             app.manage(registry);
             app.manage(notify);
@@ -278,12 +319,18 @@ pub fn run() {
             clear_managed_cookie,
             check_updates,
             check_ytdlp,
+            check_hongguo,
             clear_archive,
             open_release_url,
             app_version
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running GetTube");
+        .build(tauri::generate_context!())
+        .expect("error while building GetTube")
+        .run(|_app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                hongguo::shutdown();
+            }
+        });
 }
 
 #[cfg(test)]

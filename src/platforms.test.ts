@@ -10,6 +10,9 @@ describe("platform detection", () => {
     ["复制打开抖音 https://v.douyin.com/demo/ 看视频", "douyin"],
     ["https://x.com/openai/status/123", "twitter"],
     ["https://t.co/demo", "twitter"],
+    ["复制红果 https://applink.novelquickapp.com/example", "hongguo"],
+    ["https://hongguoduanju.com/player/123/456", "hongguo"],
+    ["https://hongguoduanju.com.example.test/player/123", "unknown"],
   ])("detects %s", (input, expected) => {
     expect(detectPlatform(input)).toBe(expected);
   });
@@ -35,6 +38,8 @@ describe("list vs channel detection", () => {
     ["https://space.bilibili.com/123/lists/456?type=season", true],
     ["https://www.youtube.com/watch?v=abc", false],
     ["https://v.douyin.com/abc/", false],
+    ["https://hongguoduanju.com/player/123/456", true],
+    ["https://applink.novelquickapp.com/example", true],
   ])("list detection for %s", (input, expected) => {
     expect(looksLikeList(input)).toBe(expected);
   });
@@ -46,6 +51,7 @@ describe("list vs channel detection", () => {
     ["https://space.bilibili.com/3546883796503085/video", true],
     ["https://space.bilibili.com/123/favlist?fid=456", false],
     ["https://space.bilibili.com/123", false],
+    ["https://hongguoduanju.com/player/123/456", false],
   ])("channel detection for %s", (input, expected) => {
     expect(looksLikeChannel(input)).toBe(expected);
   });

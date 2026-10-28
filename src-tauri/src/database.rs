@@ -18,7 +18,7 @@ pub struct Database {
 }
 
 const TASK_COLUMNS: &str =
-    "id,url,title,platform,status,progress,speed,eta,output_path,error,batch_id,batch_name";
+    "id,url,title,platform,status,progress,speed,eta,output_path,error,batch_id,batch_name,media_details";
 
 impl Database {
     pub fn new(app: &tauri::AppHandle) -> Result<Self, String> {
@@ -71,6 +71,10 @@ impl Database {
             .map_err(|error| format!("无法初始化任务数据库：{error}"))?;
         self.ensure_column("batch_id", "ALTER TABLE tasks ADD COLUMN batch_id TEXT")?;
         self.ensure_column("batch_name", "ALTER TABLE tasks ADD COLUMN batch_name TEXT")?;
+        self.ensure_column(
+            "media_details",
+            "ALTER TABLE tasks ADD COLUMN media_details TEXT",
+        )?;
         // v3 早期版本把批次展示名写进 batch_id；保留其文件夹语义供升级后重试使用。
         self.connect()?
             .execute(
@@ -109,11 +113,11 @@ impl Database {
     pub fn insert(&self, task: &DownloadTask, format_id: &str) -> Result<(), String> {
         self.connect()?
             .execute(
-                "INSERT INTO tasks (id,url,title,platform,status,progress,speed,eta,output_path,error,format_id,batch_id,batch_name)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                "INSERT INTO tasks (id,url,title,platform,status,progress,speed,eta,output_path,error,format_id,batch_id,batch_name,media_details)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 params![task.id, task.url, task.title, platform_str(task.platform), task.status,
                     task.progress, task.speed, task.eta, task.output_path, task.error, format_id, task.batch_id,
-                    task.batch_name],
+                    task.batch_name, task.media_details.as_ref().map(serde_json::Value::to_string)],
             )
             .map(|_| ())
             .map_err(|error| format!("无法保存任务：{error}"))
@@ -127,11 +131,11 @@ impl Database {
         for (task, format_id) in tasks {
             transaction
                 .execute(
-                    "INSERT INTO tasks (id,url,title,platform,status,progress,speed,eta,output_path,error,format_id,batch_id,batch_name)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    "INSERT INTO tasks (id,url,title,platform,status,progress,speed,eta,output_path,error,format_id,batch_id,batch_name,media_details)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                     params![task.id, task.url, task.title, platform_str(task.platform), task.status,
                         task.progress, task.speed, task.eta, task.output_path, task.error, format_id,
-                        task.batch_id, task.batch_name],
+                        task.batch_id, task.batch_name, task.media_details.as_ref().map(serde_json::Value::to_string)],
                 )
                 .map_err(|error| format!("无法保存批量任务：{error}"))?;
         }
@@ -172,6 +176,16 @@ impl Database {
             .map_err(|error| format!("无法更新任务：{error}"))
     }
 
+    pub fn set_media_details(&self, id: &str, details: &serde_json::Value) -> Result<(), String> {
+        self.connect()?
+            .execute(
+                "UPDATE tasks SET media_details=?2 WHERE id=?1",
+                params![id, details.to_string()],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     pub fn list(&self) -> Result<Vec<DownloadTask>, String> {
         let connection = self.connect()?;
         let mut statement = connection
@@ -196,7 +210,7 @@ impl Database {
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map(params![limit], |row| {
-                Ok((row_to_task(row)?, row.get::<_, String>(12)?))
+                Ok((row_to_task(row)?, row.get::<_, String>(13)?))
             })
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -208,7 +222,7 @@ impl Database {
             .query_row(
                 &format!("SELECT {TASK_COLUMNS},format_id FROM tasks WHERE id=?1"),
                 params![id],
-                |row| Ok((row_to_task(row)?, row.get::<_, String>(12)?)),
+                |row| Ok((row_to_task(row)?, row.get::<_, String>(13)?)),
             )
             .map_err(|_| "找不到任务".into())
     }
@@ -272,6 +286,9 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadTask> {
         error: row.get(9)?,
         batch_id: row.get(10)?,
         batch_name: row.get(11)?,
+        media_details: row
+            .get::<_, Option<String>>(12)?
+            .and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
 
@@ -281,6 +298,8 @@ fn platform_str(platform: Platform) -> &'static str {
         Platform::Bilibili => "bilibili",
         Platform::Douyin => "douyin",
         Platform::Twitter => "twitter",
+        Platform::Hongguo => "hongguo",
+        Platform::Unknown => "unknown",
     }
 }
 
@@ -289,7 +308,9 @@ fn parse_platform(value: String) -> Platform {
         "youtube" => Platform::Youtube,
         "bilibili" => Platform::Bilibili,
         "douyin" => Platform::Douyin,
-        _ => Platform::Twitter,
+        "twitter" => Platform::Twitter,
+        "hongguo" => Platform::Hongguo,
+        _ => Platform::Unknown,
     }
 }
 
@@ -311,6 +332,7 @@ mod tests {
             error: None,
             batch_id: Some("批次".into()),
             batch_name: Some("播放列表".into()),
+            media_details: None,
         }
     }
 
@@ -327,6 +349,34 @@ mod tests {
         let listed = db.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].batch_id.as_deref(), Some("批次"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hongguo_metadata_survives_queue_retry_and_completion() {
+        let (db, path) = temp_db();
+        let mut task = sample_task("hg", "queued");
+        task.platform = Platform::Hongguo;
+        task.url = "https://hongguoduanju.com/player/123/9007199254740993".into();
+        task.media_details = crate::hongguo::task_details(&task.url, "1080p");
+        db.insert_many(&[(task, "1080p".into())]).unwrap();
+        let queued = db.list_queued(1).unwrap();
+        assert!(matches!(queued[0].0.platform, Platform::Hongguo));
+        assert_eq!(
+            queued[0].0.media_details.as_ref().unwrap()["episodeId"],
+            "9007199254740993"
+        );
+        assert_eq!(db.retry_data("hg").unwrap().format_id, "1080p");
+        db.set_media_details("hg", &serde_json::json!({"actualQuality":"1080p"}))
+            .unwrap();
+        assert_eq!(
+            db.task_full("hg").unwrap().0.media_details.unwrap()["actualQuality"],
+            "1080p"
+        );
+        assert!(matches!(
+            parse_platform("future-platform".into()),
+            Platform::Unknown
+        ));
         let _ = std::fs::remove_file(path);
     }
 

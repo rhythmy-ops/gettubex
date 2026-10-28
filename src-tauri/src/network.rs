@@ -4,6 +4,7 @@ use reqwest::redirect::Policy;
 
 pub fn client(settings: &AppSettings, use_proxy: bool) -> Result<Client, String> {
     let mut builder = ClientBuilder::new()
+        .no_proxy()
         .redirect(Policy::none())
         .timeout(std::time::Duration::from_secs(20));
     if use_proxy {

@@ -97,6 +97,11 @@ export async function clearArchive(): Promise<number> {
   return invoke<number>("clear_archive");
 }
 
+export async function checkHongguo(): Promise<{ ready: boolean; nodeVersion: string; ffmpeg?: string; ffprobe?: string }> {
+  if (!inTauri()) throw new Error("请在 GetTube 桌面开发版中检查红果引擎");
+  return invoke("check_hongguo");
+}
+
 export async function openReleaseUrl(url: string): Promise<void> {
   await invoke("open_release_url", { url });
 }
